@@ -1,6 +1,23 @@
 from app.services.register import runner as runner_module
 
 
+class _DummyCookies:
+    def __init__(self) -> None:
+        self._data = {}
+
+    def get(self, name: str, default=None):
+        return self._data.get(name, default)
+
+    def set(self, name: str, value: str, domain: str = "", path: str = "/") -> None:
+        self._data[name] = value
+
+    def keys(self):
+        return self._data.keys()
+
+    def get_dict(self):
+        return dict(self._data)
+
+
 def test_extract_action_id_from_server_reference_chunk():
     text = 'let tV=(0,tR.createServerReference)("7f69646bb11542f4cad728680077c67a09624b94e0",tR.callServer,void 0,tR.findSourceMapURL,"default");'
 
@@ -60,6 +77,9 @@ def test_send_email_code_records_http_error_details():
             self.text = text
 
     class _DummySession:
+        def __init__(self) -> None:
+            self.cookies = _DummyCookies()
+
         def post(self, *args, **kwargs):
             return _DummyResponse(403, "forbidden")
 
@@ -78,6 +98,9 @@ def test_send_email_code_maps_cloudflare_403_to_clearance_hint():
             self.text = text
 
     class _DummySession:
+        def __init__(self) -> None:
+            self.cookies = _DummyCookies()
+
         def post(self, *args, **kwargs):
             return _DummyResponse(403, "<title>Attention Required! | Cloudflare</title>")
 
@@ -87,3 +110,41 @@ def test_send_email_code_maps_cloudflare_403_to_clearance_hint():
 
     assert ok is False
     assert runner._last_send_code_error == "cloudflare challenge blocked request; set grok.cf_clearance"
+
+
+def test_preflight_signup_with_solver_applies_cf_clearance_and_user_agent(monkeypatch):
+    class _DummyResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "signupReady": True,
+                "title": "Sign up",
+                "bodySnippet": "signup page ready",
+                "userAgent": "Mozilla/5.0 Test Solver",
+                "cookies": [
+                    {
+                        "name": "cf_clearance",
+                        "value": "demo-clearance",
+                        "domain": "accounts.x.ai",
+                        "path": "/",
+                    }
+                ],
+            }
+
+    class _DummySession:
+        def __init__(self) -> None:
+            self.cookies = _DummyCookies()
+
+    monkeypatch.setattr(runner_module.http_requests, "get", lambda *args, **kwargs: _DummyResponse())
+
+    runner = runner_module.RegisterRunner(target_count=1, thread_count=1)
+    session = _DummySession()
+
+    ok = runner._preflight_signup_with_solver(session, "Mozilla/5.0 Original")
+
+    assert ok is True
+    assert session.cookies.get("cf_clearance") == "demo-clearance"
+    assert runner._cf_clearance == "demo-clearance"
+    assert runner._solver_user_agent == "Mozilla/5.0 Test Solver"
