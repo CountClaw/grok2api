@@ -10,6 +10,7 @@ import threading
 import time
 from typing import Callable, Dict, List, Optional, Tuple
 from urllib.parse import urljoin
+from urllib.request import Request, urlopen
 
 from bs4 import BeautifulSoup
 from curl_cffi import requests as curl_requests
@@ -26,6 +27,10 @@ from app.services.register.services import (
 
 SITE_URL = "https://accounts.x.ai"
 DEFAULT_IMPERSONATE = "chrome120"
+BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+)
 
 CHROME_PROFILES = [
     {"impersonate": "chrome110", "version": "110.0.0.0", "brand": "chrome"},
@@ -68,6 +73,49 @@ def _extract_action_id_from_text(text: str) -> Optional[str]:
         if match:
             return match.group(0)
     return None
+
+
+def _apply_config_from_html(config: Dict[str, Optional[str]], html: str) -> None:
+    key_match = re.search(r'sitekey":"(0x4[a-zA-Z0-9_-]+)"', html)
+    if key_match:
+        config["site_key"] = key_match.group(1)
+
+    tree_match = re.search(r'next-router-state-tree":"([^"]+)"', html)
+    if tree_match:
+        config["state_tree"] = tree_match.group(1)
+
+
+def _discover_action_id(start_url: str, html: str, fetch_text: Callable[[str], str]) -> Tuple[Optional[str], int]:
+    action_id = _extract_action_id_from_text(html)
+    if action_id:
+        return action_id, 0
+
+    js_urls = _extract_js_urls_from_html(start_url, html)
+    for js_url in js_urls:
+        try:
+            js_content = fetch_text(js_url)
+        except Exception as exc:
+            logger.debug("Register: failed to fetch JS chunk {}: {}", js_url, exc)
+            continue
+
+        action_id = _extract_action_id_from_text(js_content)
+        if action_id:
+            return action_id, len(js_urls)
+
+    return None, len(js_urls)
+
+
+def _fetch_text_via_urllib(url: str, *, referer: Optional[str] = None, accept: str = "*/*") -> str:
+    headers = {
+        "user-agent": BROWSER_USER_AGENT,
+        "accept": accept,
+        "accept-language": "en-US,en;q=0.9",
+    }
+    if referer:
+        headers["referer"] = referer
+
+    with urlopen(Request(url, headers=headers), timeout=20) as resp:
+        return resp.read().decode("utf-8", "ignore")
 
 
 def _extract_email_verification_code(text: str) -> Optional[str]:
@@ -212,30 +260,45 @@ class RegisterRunner:
         logger.info("Register: initializing action config...")
         start_url = f"{SITE_URL}/sign-up"
 
-        with curl_requests.Session(impersonate=DEFAULT_IMPERSONATE) as session:
-            html = session.get(start_url, timeout=15).text
+        try:
+            with curl_requests.Session(impersonate=DEFAULT_IMPERSONATE) as session:
+                html = session.get(start_url, timeout=15).text
+                _apply_config_from_html(self._config, html)
 
-            key_match = re.search(r'sitekey":"(0x4[a-zA-Z0-9_-]+)"', html)
-            if key_match:
-                self._config["site_key"] = key_match.group(1)
+                action_id, js_count = _discover_action_id(
+                    start_url,
+                    html,
+                    lambda js_url: session.get(js_url, timeout=15).text,
+                )
+                logger.info("Register: curl_cffi init scan completed, js_chunks={}", js_count)
 
-            tree_match = re.search(r'next-router-state-tree":"([^"]+)"', html)
-            if tree_match:
-                self._config["state_tree"] = tree_match.group(1)
-
-            js_urls = _extract_js_urls_from_html(start_url, html)
-            html_action_id = _extract_action_id_from_text(html)
-            if html_action_id:
-                self._config["action_id"] = html_action_id
-                logger.info("Register: Action ID found in HTML: {}", self._config["action_id"])
-
-            for js_url in js_urls:
-                js_content = session.get(js_url, timeout=15).text
-                action_id = _extract_action_id_from_text(js_content)
                 if action_id:
                     self._config["action_id"] = action_id
-                    logger.info("Register: Action ID found: {}", self._config["action_id"])
-                    break
+                    logger.info("Register: Action ID found via curl_cffi: {}", action_id)
+        except Exception as exc:
+            logger.warning("Register: curl_cffi init scan failed: {}", exc)
+
+        if not self._config.get("action_id"):
+            logger.warning("Register: action_id not found via curl_cffi, retrying with urllib.")
+            try:
+                html = _fetch_text_via_urllib(
+                    start_url,
+                    accept="text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                )
+                _apply_config_from_html(self._config, html)
+
+                action_id, js_count = _discover_action_id(
+                    start_url,
+                    html,
+                    lambda js_url: _fetch_text_via_urllib(js_url, referer=start_url, accept="*/*"),
+                )
+                logger.info("Register: urllib init scan completed, js_chunks={}", js_count)
+
+                if action_id:
+                    self._config["action_id"] = action_id
+                    logger.info("Register: Action ID found via urllib: {}", action_id)
+            except Exception as exc:
+                logger.warning("Register: urllib init scan failed: {}", exc)
 
         if not self._config.get("action_id"):
             raise RuntimeError("Register init failed: missing action_id")
