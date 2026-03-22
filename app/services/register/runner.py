@@ -397,6 +397,63 @@ class RegisterRunner:
         )
         return signup_ready or applied > 0 or has_clearance
 
+    def _send_email_code_via_solver_browser(
+        self,
+        session: curl_requests.Session,
+        email: str,
+        user_agent: str,
+    ) -> bool:
+        endpoint = f"{self._solver_url.rstrip('/')}/signup-email"
+        try:
+            res = http_requests.get(
+                endpoint,
+                params={"url": SIGNUP_URL, "email": email},
+                timeout=120,
+            )
+            res.raise_for_status()
+            payload = res.json()
+        except Exception as exc:
+            logger.warning("Register: solver browser send_email_code request failed: {}", exc)
+            return False
+
+        cookies = payload.get("cookies") if isinstance(payload, dict) else None
+        applied = self._apply_solver_cookies(session, cookies if isinstance(cookies, list) else [])
+        solver_user_agent = str(payload.get("userAgent") or "").strip() if isinstance(payload, dict) else ""
+        if solver_user_agent:
+            self._solver_user_agent = solver_user_agent
+        verify_step_ready = bool(payload.get("verifyStepReady")) if isinstance(payload, dict) else False
+        submitted = bool(payload.get("submitted")) if isinstance(payload, dict) else False
+        domain_rejected = str(payload.get("domainRejected") or "").strip() if isinstance(payload, dict) else ""
+        title = str(payload.get("title") or "").strip() if isinstance(payload, dict) else ""
+        body_snippet = str(payload.get("bodySnippet") or "").strip() if isinstance(payload, dict) else ""
+        displayed_email = str(payload.get("displayedEmail") or "").strip() if isinstance(payload, dict) else ""
+        has_clearance = bool(self._get_session_cookie_value(session, "cf_clearance"))
+
+        logger.info(
+            "Register: solver browser send_email_code submitted={} verify_step_ready={} domain_rejected={} displayed_email={} applied_cookies={} has_cf_clearance={} title={} body={}",
+            submitted,
+            verify_step_ready,
+            domain_rejected or "-",
+            displayed_email or "-",
+            applied,
+            has_clearance,
+            title or "-",
+            body_snippet[:160] or "-",
+        )
+
+        if domain_rejected:
+            self._last_send_code_error = f"email domain rejected: {domain_rejected}"
+            return False
+
+        normalized_email = email.strip().lower()
+        if verify_step_ready or (submitted and displayed_email.strip().lower() == normalized_email):
+            self._last_send_code_error = None
+            return True
+
+        if not self._last_send_code_error:
+            self._last_send_code_error = "solver browser failed to enter verify step"
+        return False
+
     def _send_email_code(
         self,
         session: curl_requests.Session,
@@ -522,6 +579,7 @@ class RegisterRunner:
                     password = _generate_random_string()
 
                     jwt, email = email_service.create_email()
+                    current_email_provider = email_service.email_provider
                     if not email:
                         self._record_error("create_email failed")
                         time.sleep(5)
@@ -543,6 +601,18 @@ class RegisterRunner:
                                     "Register: CreateEmailValidationCode still failed after solver preflight: {}",
                                     self._last_send_code_error or "-",
                                 )
+                                send_ok = self._send_email_code_via_solver_browser(
+                                    session,
+                                    email,
+                                    retry_user_agent,
+                                )
+                                if send_ok:
+                                    logger.info("Register: send_email_code succeeded via solver browser fallback")
+                                else:
+                                    logger.warning(
+                                        "Register: solver browser fallback still failed: {}",
+                                        self._last_send_code_error or "-",
+                                    )
 
                     if not send_ok and email_service.can_fallback_to_moemail():
                         fallback_jwt, fallback_email = email_service.create_email(provider_override="moemail")
@@ -554,8 +624,18 @@ class RegisterRunner:
                             )
                             fallback_user_agent = self._solver_user_agent or account_user_agent
                             send_ok = self._send_email_code(session, fallback_email, fallback_user_agent)
+                            if (
+                                not send_ok
+                                and "cloudflare challenge blocked request" in (self._last_send_code_error or "")
+                            ):
+                                send_ok = self._send_email_code_via_solver_browser(
+                                    session,
+                                    fallback_email,
+                                    fallback_user_agent,
+                                )
                             if send_ok:
                                 jwt, email = fallback_jwt, fallback_email
+                                current_email_provider = "moemail"
                                 logger.info("Register: send_email_code succeeded after mailbox fallback {}", email)
                             else:
                                 logger.warning(
@@ -577,7 +657,10 @@ class RegisterRunner:
                         time.sleep(1)
                         if self.stop_event.is_set():
                             return
-                        content = email_service.fetch_first_email(jwt)
+                        content = email_service.fetch_first_email(
+                            jwt,
+                            provider_override=current_email_provider,
+                        )
                         if content:
                             code = _extract_email_verification_code(content)
                             if code:
