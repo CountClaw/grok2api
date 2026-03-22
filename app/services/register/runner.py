@@ -14,6 +14,7 @@ from urllib.request import Request, urlopen
 
 from bs4 import BeautifulSoup
 from curl_cffi import requests as curl_requests
+import requests as http_requests
 
 from app.core.config import get_config
 from app.core.logger import logger
@@ -204,6 +205,8 @@ class RegisterRunner:
         self._accounts: List[Dict[str, str]] = []
         self._last_send_code_error: Optional[str] = None
         self._cf_clearance = str(get_config("grok.cf_clearance", "") or "").strip()
+        self._solver_url = str(get_config("register.solver_url", "http://127.0.0.1:5072") or "http://127.0.0.1:5072").strip()
+        self._solver_user_agent: Optional[str] = None
 
         self._config: Dict[str, Optional[str]] = {
             "site_key": "0x4AAAAAAAhr9JGVDZbrZOo0",
@@ -307,6 +310,93 @@ class RegisterRunner:
         if not self._config.get("action_id"):
             raise RuntimeError("Register init failed: missing action_id")
 
+    @staticmethod
+    def _get_session_cookie_value(session: object, name: str) -> str:
+        jar = getattr(session, "cookies", None)
+        if jar is None:
+            return ""
+        try:
+            value = jar.get(name)
+        except Exception:
+            return ""
+        return str(value or "")
+
+    @classmethod
+    def _get_session_cookie_names(cls, session: object) -> List[str]:
+        jar = getattr(session, "cookies", None)
+        if jar is None:
+            return []
+        try:
+            return sorted(str(key) for key in jar.keys())
+        except Exception:
+            pass
+        try:
+            data = jar.get_dict()
+            if isinstance(data, dict):
+                return sorted(str(key) for key in data.keys())
+        except Exception:
+            pass
+        return []
+
+    def _apply_solver_cookies(self, session: curl_requests.Session, cookies: List[Dict[str, str]]) -> int:
+        applied = 0
+        for item in cookies:
+            name = str(item.get("name") or "").strip()
+            value = str(item.get("value") or "").strip()
+            if not name or not value:
+                continue
+            domain = str(item.get("domain") or "accounts.x.ai").strip() or "accounts.x.ai"
+            path = str(item.get("path") or "/").strip() or "/"
+            try:
+                session.cookies.set(name, value, domain=domain, path=path)
+                if name == "cf_clearance":
+                    self._cf_clearance = value
+                applied += 1
+            except Exception as exc:
+                logger.debug("Register: failed to apply solver cookie {}: {}", name, exc)
+        return applied
+
+    def _preflight_signup_with_solver(
+        self,
+        session: curl_requests.Session,
+        user_agent: str,
+    ) -> bool:
+        endpoint = f"{self._solver_url.rstrip('/')}/preflight"
+        try:
+            res = http_requests.get(
+                endpoint,
+                params={"url": SIGNUP_URL},
+                timeout=90,
+            )
+            res.raise_for_status()
+            payload = res.json()
+        except Exception as exc:
+            logger.warning("Register: solver preflight request failed: {}", exc)
+            return False
+
+        cookies = payload.get("cookies") if isinstance(payload, dict) else None
+        applied = self._apply_solver_cookies(session, cookies if isinstance(cookies, list) else [])
+        solver_user_agent = str(payload.get("userAgent") or "").strip() if isinstance(payload, dict) else ""
+        if solver_user_agent:
+            self._solver_user_agent = solver_user_agent
+        title = str(payload.get("title") or "").strip() if isinstance(payload, dict) else ""
+        body_snippet = str(payload.get("bodySnippet") or "").strip() if isinstance(payload, dict) else ""
+        signup_ready = bool(payload.get("signupReady")) if isinstance(payload, dict) else False
+        challenge_present = bool(payload.get("challengePresent")) if isinstance(payload, dict) else False
+        has_clearance = bool(self._get_session_cookie_value(session, "cf_clearance"))
+
+        logger.info(
+            "Register: solver preflight signup_ready={} challenge_present={} title={} applied_cookies={} has_cf_clearance={} solver_ua={} body={}",
+            signup_ready,
+            challenge_present,
+            title or "-",
+            applied,
+            has_clearance,
+            solver_user_agent or (user_agent or "-"),
+            body_snippet[:160] or "-",
+        )
+        return signup_ready or applied > 0 or has_clearance
+
     def _send_email_code(
         self,
         session: curl_requests.Session,
@@ -324,18 +414,21 @@ class RegisterRunner:
             "accept-language": "en-US,en;q=0.9",
             "origin": SITE_URL,
             "referer": SIGNUP_URL,
-            "user-agent": user_agent or BROWSER_USER_AGENT,
+            "user-agent": user_agent or self._solver_user_agent or BROWSER_USER_AGENT,
             "sec-fetch-site": "same-origin",
             "sec-fetch-mode": "cors",
             "sec-fetch-dest": "empty",
         }
         try:
             res = session.post(url, data=data, headers=headers, timeout=15)
+            has_clearance = bool(self._get_session_cookie_value(session, "cf_clearance")) or bool(self._cf_clearance)
+            cookie_names = ",".join(self._get_session_cookie_names(session)) or "-"
             if res.status_code == 200:
                 logger.info(
-                    "Register: CreateEmailValidationCode ok email={} cookies={}",
+                    "Register: CreateEmailValidationCode ok email={} cf_clearance={} cookies={}",
                     email,
-                    ",".join(sorted(session.cookies.get_dict().keys())) or "-",
+                    has_clearance,
+                    cookie_names,
                 )
                 return True
             body = (getattr(res, "text", "") or "").strip().replace("\n", " ")
@@ -351,8 +444,8 @@ class RegisterRunner:
                 "Register: CreateEmailValidationCode failed email={} status={} cf_clearance={} cookies={} body={}",
                 email,
                 res.status_code,
-                bool(self._cf_clearance),
-                ",".join(sorted(session.cookies.get_dict().keys())) or "-",
+                has_clearance,
+                cookie_names,
                 body[:200] or "-",
             )
             return False
@@ -361,7 +454,7 @@ class RegisterRunner:
             logger.warning(
                 "Register: CreateEmailValidationCode exception email={} cf_clearance={} error={}",
                 email,
-                bool(self._cf_clearance),
+                bool(self._get_session_cookie_value(session, "cf_clearance")) or bool(self._cf_clearance),
                 self._last_send_code_error,
             )
             return False
@@ -420,7 +513,7 @@ class RegisterRunner:
                             "Register: preheat sign-up status={} cf_clearance={} cookies={} body={}",
                             preheat_res.status_code,
                             bool(self._cf_clearance),
-                            ",".join(sorted(session.cookies.get_dict().keys())) or "-",
+                            ",".join(self._get_session_cookie_names(session)) or "-",
                             body_head or "-",
                         )
                     except Exception as exc:
@@ -437,24 +530,47 @@ class RegisterRunner:
                     if self.stop_event.is_set():
                         return
 
-                    if not self._send_email_code(session, email, account_user_agent):
-                        fallback_applied = False
-                        if email_service.can_fallback_to_moemail():
-                            fallback_jwt, fallback_email = email_service.create_email(provider_override="moemail")
-                            if fallback_email:
-                                logger.info(
-                                    "Register: send_email_code failed for worker mailbox {}, retrying with moemail {}",
-                                    email,
-                                    fallback_email,
+                    send_ok = self._send_email_code(session, email, account_user_agent)
+                    if not send_ok and "cloudflare challenge blocked request" in (self._last_send_code_error or ""):
+                        logger.info("Register: CreateEmailValidationCode hit Cloudflare, trying solver preflight")
+                        if self._preflight_signup_with_solver(session, account_user_agent):
+                            retry_user_agent = self._solver_user_agent or account_user_agent
+                            send_ok = self._send_email_code(session, email, retry_user_agent)
+                            if send_ok:
+                                logger.info("Register: CreateEmailValidationCode succeeded after solver preflight")
+                            else:
+                                logger.warning(
+                                    "Register: CreateEmailValidationCode still failed after solver preflight: {}",
+                                    self._last_send_code_error or "-",
                                 )
-                                if self._send_email_code(session, fallback_email, account_user_agent):
-                                    jwt, email = fallback_jwt, fallback_email
-                                    fallback_applied = True
-                        if not fallback_applied:
-                            detail = f" ({self._last_send_code_error})" if self._last_send_code_error else ""
-                            self._record_error(f"send_email_code failed: {email}{detail}")
-                            time.sleep(5)
-                            continue
+
+                    if not send_ok and email_service.can_fallback_to_moemail():
+                        fallback_jwt, fallback_email = email_service.create_email(provider_override="moemail")
+                        if fallback_jwt and fallback_email:
+                            logger.info(
+                                "Register: send_email_code failed for mailbox {}, retrying with moemail {}",
+                                email,
+                                fallback_email,
+                            )
+                            fallback_user_agent = self._solver_user_agent or account_user_agent
+                            send_ok = self._send_email_code(session, fallback_email, fallback_user_agent)
+                            if send_ok:
+                                jwt, email = fallback_jwt, fallback_email
+                                logger.info("Register: send_email_code succeeded after mailbox fallback {}", email)
+                            else:
+                                logger.warning(
+                                    "Register: send_email_code still failed after mailbox fallback {}: {}",
+                                    fallback_email,
+                                    self._last_send_code_error or "-",
+                                )
+                        else:
+                            logger.warning("Register: moemail fallback mailbox creation failed")
+
+                    if not send_ok:
+                        detail = f" ({self._last_send_code_error})" if self._last_send_code_error else ""
+                        self._record_error(f"send_email_code failed: {email}{detail}")
+                        time.sleep(5)
+                        continue
 
                     verify_code = None
                     for _ in range(30):
