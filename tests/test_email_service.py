@@ -89,6 +89,39 @@ def test_moemail_create_and_fetch_email(monkeypatch):
     assert "ABC-123" in content
 
 
+def test_email_service_can_create_moemail_with_provider_override(monkeypatch):
+    service = EmailService(
+        email_provider="worker",
+        worker_domain="worker.example.com",
+        email_domain="003218.xyz",
+        admin_password="demo-pass",
+        moemail_api_base="https://mail.kythron.com",
+        moemail_api_key="demo-key",
+        moemail_domain="moemail.app",
+    )
+
+    def _fake_post(url, json, headers, timeout):
+        if url == "https://mail.kythron.com/api/emails/generate":
+            return _DummyResponse(
+                200,
+                {
+                    "email": {
+                        "id": "email-2",
+                        "address": "fallback@moemail.app",
+                    }
+                },
+            )
+        raise AssertionError(url)
+
+    monkeypatch.setattr("app.services.register.services.email_service.requests.post", _fake_post)
+
+    email_id, address = service.create_email(provider_override="moemail")
+
+    assert service.can_fallback_to_moemail() is True
+    assert email_id == "email-2"
+    assert address == "fallback@moemail.app"
+
+
 def test_extract_email_verification_code_accepts_subject_style_code():
     text = "ABC-123 xAI confirmation code"
 

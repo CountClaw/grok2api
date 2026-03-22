@@ -212,6 +212,9 @@ class EmailService:
             print(f"[-] Moemail create error: {exc}")
         return None, None
 
+    def can_fallback_to_moemail(self) -> bool:
+        return self.email_provider != "moemail" and bool(self.moemail_api_key)
+
     def _find_email_id_by_address(self, address: str) -> Optional[str]:
         try:
             res = requests.get(
@@ -274,9 +277,10 @@ class EmailService:
             print(f"Moemail fetch failed: {exc}")
             return None
 
-    def create_email(self) -> Tuple[Optional[str], Optional[str]]:
+    def create_email(self, provider_override: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
         """Create a temporary mailbox. Returns (jwt, address)."""
-        if self.email_provider == "moemail":
+        provider = (provider_override or self.email_provider or "").strip().lower()
+        if provider == "moemail":
             return self._create_email_moemail()
 
         url = f"https://{self.worker_domain}/admin/new_address"

@@ -378,9 +378,22 @@ class RegisterRunner:
                         return
 
                     if not self._send_email_code(session, email):
-                        self._record_error(f"send_email_code failed: {email}")
-                        time.sleep(5)
-                        continue
+                        fallback_applied = False
+                        if email_service.can_fallback_to_moemail():
+                            fallback_jwt, fallback_email = email_service.create_email(provider_override="moemail")
+                            if fallback_email:
+                                logger.info(
+                                    "Register: send_email_code failed for worker mailbox {}, retrying with moemail {}",
+                                    email,
+                                    fallback_email,
+                                )
+                                if self._send_email_code(session, fallback_email):
+                                    jwt, email = fallback_jwt, fallback_email
+                                    fallback_applied = True
+                        if not fallback_applied:
+                            self._record_error(f"send_email_code failed: {email}")
+                            time.sleep(5)
+                            continue
 
                     verify_code = None
                     for _ in range(30):
