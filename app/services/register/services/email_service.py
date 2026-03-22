@@ -307,9 +307,10 @@ class EmailService:
             print(f"[-] Email create error ({url}): {exc}")
         return None, None
 
-    def fetch_first_email(self, jwt: str) -> Optional[str]:
+    def fetch_first_email(self, jwt: str, provider_override: Optional[str] = None) -> Optional[str]:
         """Fetch the first email content for the mailbox."""
-        if self.email_provider == "moemail":
+        provider = (provider_override or self.email_provider or "").strip().lower()
+        if provider == "moemail":
             return self._fetch_first_email_moemail(jwt)
 
         try:
