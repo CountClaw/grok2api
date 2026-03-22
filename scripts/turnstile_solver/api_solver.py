@@ -153,6 +153,7 @@ class TurnstileAPIServer:
         self.app.route('/turnstile', methods=['GET'])(self.process_turnstile)
         self.app.route('/result', methods=['GET'])(self.get_result)
         self.app.route('/preflight', methods=['GET'])(self.preflight_signup)
+        self.app.route('/signup-email', methods=['GET'])(self.signup_email)
         self.app.route('/')(self.index)
         
 
@@ -616,6 +617,214 @@ class TurnstileAPIServer:
             }
 
         return context_options
+
+    async def _wait_for_signup_ready(self, page, context, index: int):
+        click_count = 0
+        signup_state = {}
+        turnstile_state = {}
+        cookies = []
+
+        for attempt in range(18):
+            signup_state = await self._read_signup_state(page)
+            turnstile_state = await self._read_turnstile_state(page)
+            cookies = await context.cookies()
+            has_clearance = any(
+                cookie.get("name") == "cf_clearance" and str(cookie.get("value") or "").strip()
+                for cookie in cookies
+            )
+            challenge_present = bool(signup_state.get("challengePresent")) or bool(turnstile_state.get("hasWidget"))
+
+            if signup_state.get("signUpButtonCount", 0) and not signup_state.get("emailInputCount", 0):
+                try:
+                    await page.locator("button:has-text('Sign up with email')").first.click(timeout=3000)
+                    await asyncio.sleep(1)
+                    signup_state = await self._read_signup_state(page)
+                except Exception as exc:
+                    if self.debug:
+                        logger.debug(f"Browser {index}: Sign up with email click skipped: {str(exc)}")
+
+            if signup_state.get("signupReady") or has_clearance:
+                break
+
+            if challenge_present and attempt in {1, 3, 5, 8, 11, 14}:
+                click_success = await self._click_turnstile_box(page, index)
+                if not click_success:
+                    click_success = await self._try_click_strategies(page, index)
+                click_count += 1
+                logger.info(f"Browser {index}: signup ready click attempt {click_count} success={click_success}")
+                await asyncio.sleep(2)
+                continue
+
+            if attempt in {0, 4, 9, 14, 17}:
+                logger.info(
+                    f"Browser {index}: wait signup ready attempt={attempt + 1} "
+                    f"ready={bool(signup_state.get('signupReady'))} "
+                    f"challenge={challenge_present} "
+                    f"cookies={','.join(sorted(str(cookie.get('name') or '') for cookie in cookies if cookie.get('name'))) or '-'} "
+                    f"title={str(signup_state.get('title') or '-')}"
+                )
+
+            await asyncio.sleep(1.2)
+
+        signup_state = await self._read_signup_state(page)
+        turnstile_state = await self._read_turnstile_state(page)
+        cookies = await context.cookies()
+        return signup_state, turnstile_state, cookies
+
+    async def _submit_email_address(self, page, index: int, email: str) -> bool:
+        try:
+            sign_up_button_count = 0
+            email_input_count = 0
+            try:
+                sign_up_button_count = await page.locator("button:has-text('Sign up with email')").count()
+            except Exception:
+                sign_up_button_count = 0
+            try:
+                email_input_count = await page.locator('input[name="email"]').count()
+            except Exception:
+                email_input_count = 0
+
+            if sign_up_button_count > 0 and email_input_count == 0:
+                try:
+                    await page.locator("button:has-text('Sign up with email')").first.click(timeout=5000)
+                    await asyncio.sleep(1)
+                except Exception as exc:
+                    if self.debug:
+                        logger.debug(f"Browser {index}: Sign up with email button click failed: {str(exc)}")
+
+            email_input = page.locator('input[name="email"]').first
+            await email_input.wait_for(timeout=10000)
+            await email_input.click()
+            try:
+                await email_input.fill("")
+            except Exception:
+                pass
+            await email_input.type(email, delay=random.randint(30, 70))
+            await asyncio.sleep(0.5)
+            await email_input.press("Enter")
+            logger.info(f"Browser {index}: Submitted email address {email}")
+            await asyncio.sleep(2)
+            return True
+        except Exception as exc:
+            logger.warning(f"Browser {index}: submit email address failed: {str(exc)}")
+            return False
+
+    async def _fallback_submit_email(self, page, index: int) -> bool:
+        try:
+            await page.evaluate("""() => {
+                const email = document.querySelector('input[name="email"]');
+                if (!email) return false;
+                const form = email.form;
+                if (!form) return false;
+                if (typeof form.requestSubmit === 'function') {
+                    form.requestSubmit();
+                } else {
+                    form.submit();
+                }
+                return true;
+            }""")
+            logger.info(f"Browser {index}: Executed fallback email form submit")
+            return True
+        except Exception as exc:
+            logger.warning(f"Browser {index}: fallback email form submit failed: {str(exc)}")
+            return False
+
+    async def _read_verify_email(self, page) -> str:
+        try:
+            result = await page.evaluate("""() => {
+                const text = document.body ? document.body.innerText : '';
+                const match = text.match(/We(?:'|’)ve emailed .*? to\\s+([^\\s]+@[^\\s]+)\\.?/i);
+                return match ? match[1] : '';
+            }""")
+            return str(result or "").strip().lower().rstrip('.')
+        except Exception:
+            return ""
+
+    async def _detect_rejected_email_domain(self, page) -> str:
+        try:
+            result = await page.evaluate("""() => {
+                const text = document.body ? document.body.innerText : '';
+                const match = text.match(/Your email domain\\s+([^\\s]+)\\s+has been rejected\\./i);
+                return match ? match[1] : '';
+            }""")
+            return str(result or "").strip().lower()
+        except Exception:
+            return ""
+
+    async def _wait_for_email_verify_step(self, page, index: int, email: str):
+        expected_email = (email or "").strip().lower()
+        last_displayed_email = ""
+
+        for attempt in range(18):
+            displayed_email = await self._read_verify_email(page)
+            if displayed_email:
+                last_displayed_email = displayed_email
+
+            rejected_domain = await self._detect_rejected_email_domain(page)
+            if rejected_domain:
+                return {
+                    "verifyStepReady": False,
+                    "displayedEmail": last_displayed_email,
+                    "domainRejected": rejected_domain,
+                }
+
+            try:
+                password_count = await page.locator('input[name="password"]').count()
+            except Exception:
+                password_count = 0
+
+            try:
+                code_input_count = await page.locator(
+                    "input[autocomplete='one-time-code'], "
+                    "input[inputmode='numeric'], "
+                    "input[maxlength='1'], "
+                    "input[name*='code'], "
+                    "input[id*='code']"
+                ).count()
+            except Exception:
+                code_input_count = 0
+
+            try:
+                email_input_visible = await page.locator('input[name="email"]:visible').count() > 0
+            except Exception:
+                email_input_visible = False
+
+            verify_ready = (
+                code_input_count > 0
+                or password_count > 0
+                or (displayed_email and displayed_email == expected_email)
+            )
+            if verify_ready:
+                logger.info(
+                    f"Browser {index}: verify step ready displayed_email={displayed_email or '-'} "
+                    f"code_inputs={code_input_count} password_inputs={password_count}"
+                )
+                return {
+                    "verifyStepReady": True,
+                    "displayedEmail": displayed_email or last_displayed_email,
+                    "domainRejected": "",
+                }
+
+            if email_input_visible and attempt in {2, 5, 9}:
+                await self._fallback_submit_email(page, index)
+                await asyncio.sleep(2)
+                continue
+
+            if attempt in {4, 9, 14, 17}:
+                logger.info(
+                    f"Browser {index}: waiting verify step attempt={attempt + 1} "
+                    f"displayed_email={displayed_email or '-'} "
+                    f"email_input_visible={email_input_visible} code_inputs={code_input_count} "
+                    f"password_inputs={password_count}"
+                )
+
+            await asyncio.sleep(1)
+
+        return {
+            "verifyStepReady": False,
+            "displayedEmail": last_displayed_email,
+            "domainRejected": "",
+        }
 
     async def _get_turnstile_box(self, page, index: int):
         """获取 Cloudflare iframe 的坐标。"""
@@ -1137,55 +1346,7 @@ class TurnstileAPIServer:
                 if self.debug:
                     logger.debug(f"Browser {index}: signup preflight networkidle wait timed out")
 
-            click_count = 0
-            signup_state = {}
-            turnstile_state = {}
-
-            for attempt in range(18):
-                signup_state = await self._read_signup_state(page)
-                turnstile_state = await self._read_turnstile_state(page)
-                cookies = await context.cookies()
-                has_clearance = any(
-                    cookie.get("name") == "cf_clearance" and str(cookie.get("value") or "").strip()
-                    for cookie in cookies
-                )
-                challenge_present = bool(signup_state.get("challengePresent")) or bool(turnstile_state.get("hasWidget"))
-
-                if signup_state.get("signUpButtonCount", 0) and not signup_state.get("emailInputCount", 0):
-                    try:
-                        await page.locator("button:has-text('Sign up with email')").first.click(timeout=3000)
-                        await asyncio.sleep(1)
-                        signup_state = await self._read_signup_state(page)
-                    except Exception as exc:
-                        if self.debug:
-                            logger.debug(f"Browser {index}: Sign up with email click skipped: {str(exc)}")
-
-                if signup_state.get("signupReady") or has_clearance:
-                    break
-
-                if challenge_present and attempt in {1, 3, 5, 8, 11, 14}:
-                    click_success = await self._click_turnstile_box(page, index)
-                    if not click_success:
-                        click_success = await self._try_click_strategies(page, index)
-                    click_count += 1
-                    logger.info(f"Browser {index}: signup preflight click attempt {click_count} success={click_success}")
-                    await asyncio.sleep(2)
-                    continue
-
-                if attempt in {0, 4, 9, 14, 17}:
-                    logger.info(
-                        f"Browser {index}: signup preflight attempt={attempt + 1} "
-                        f"ready={bool(signup_state.get('signupReady'))} "
-                        f"challenge={challenge_present} "
-                        f"cookies={','.join(sorted(str(cookie.get('name') or '') for cookie in cookies if cookie.get('name'))) or '-'} "
-                        f"title={str(signup_state.get('title') or '-')}"
-                    )
-
-                await asyncio.sleep(1.2)
-
-            signup_state = await self._read_signup_state(page)
-            turnstile_state = await self._read_turnstile_state(page)
-            cookies = await context.cookies()
+            signup_state, turnstile_state, cookies = await self._wait_for_signup_ready(page, context, index)
             has_clearance = any(
                 cookie.get("name") == "cf_clearance" and str(cookie.get("value") or "").strip()
                 for cookie in cookies
@@ -1256,6 +1417,138 @@ class TurnstileAPIServer:
             }), 400
 
         payload = await self._preflight_signup(url)
+        return jsonify(payload), 200
+
+    async def _signup_email_via_browser(self, url: str, email: str):
+        index, browser, browser_config = await self.browser_pool.get()
+        context = None
+        page = None
+
+        try:
+            try:
+                if hasattr(browser, 'is_connected') and not browser.is_connected():
+                    logger.warning(f"Browser {index}: Browser disconnected during signup-email")
+                    return {
+                        "submitted": False,
+                        "verifyStepReady": False,
+                        "displayedEmail": "",
+                        "domainRejected": "",
+                        "title": "",
+                        "url": url,
+                        "bodySnippet": "",
+                        "cookies": [],
+                        "userAgent": browser_config.get("useragent") or "",
+                        "error": "browser disconnected",
+                    }
+            except Exception as exc:
+                if self.debug:
+                    logger.warning(f"Browser {index}: Cannot check browser state during signup-email: {str(exc)}")
+
+            context = await browser.new_context(**self._build_context_options(browser_config))
+            page = await context.new_page()
+
+            await self._antishadow_inject(page)
+            await page.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => undefined,
+            });
+
+            window.chrome = {
+                runtime: {},
+                loadTimes: function() {},
+                csi: function() {},
+            };
+            """)
+
+            if self.browser_type in ['chromium', 'chrome', 'msedge']:
+                await page.set_viewport_size({"width": 1280, "height": 900})
+
+            logger.info(f"Browser {index}: Starting signup-email for {email} on {url}")
+            await page.goto(url, wait_until='domcontentloaded', timeout=45000)
+
+            try:
+                await page.wait_for_load_state('networkidle', timeout=5000)
+            except Exception:
+                if self.debug:
+                    logger.debug(f"Browser {index}: signup-email networkidle wait timed out")
+
+            await self._wait_for_signup_ready(page, context, index)
+            submitted = await self._submit_email_address(page, index, email)
+            verify_result = await self._wait_for_email_verify_step(page, index, email)
+
+            signup_state = await self._read_signup_state(page)
+            turnstile_state = await self._read_turnstile_state(page)
+            cookies = await context.cookies()
+            has_clearance = any(
+                cookie.get("name") == "cf_clearance" and str(cookie.get("value") or "").strip()
+                for cookie in cookies
+            )
+
+            payload = {
+                "submitted": submitted,
+                "verifyStepReady": bool(verify_result.get("verifyStepReady")),
+                "displayedEmail": str(verify_result.get("displayedEmail") or ""),
+                "domainRejected": str(verify_result.get("domainRejected") or ""),
+                "challengePresent": bool(signup_state.get("challengePresent")) or bool(turnstile_state.get("hasWidget")),
+                "title": str(signup_state.get("title") or ""),
+                "url": str(signup_state.get("url") or url),
+                "bodySnippet": str(signup_state.get("bodySnippet") or ""),
+                "hasCfClearance": has_clearance,
+                "turnstileState": turnstile_state,
+                "cookies": cookies,
+                "userAgent": browser_config.get("useragent") or "",
+            }
+            logger.info(
+                f"Browser {index}: signup-email done submitted={payload['submitted']} "
+                f"verify_ready={payload['verifyStepReady']} displayed_email={payload['displayedEmail'] or '-'} "
+                f"domain_rejected={payload['domainRejected'] or '-'} has_cf_clearance={payload['hasCfClearance']} "
+                f"title={payload['title'] or '-'} body={str(payload['bodySnippet'])[:180] or '-'}"
+            )
+            return payload
+        except Exception as exc:
+            logger.warning(f"Browser {index}: signup-email failed: {str(exc)}")
+            return {
+                "submitted": False,
+                "verifyStepReady": False,
+                "displayedEmail": "",
+                "domainRejected": "",
+                "title": "",
+                "url": url,
+                "bodySnippet": "",
+                "cookies": [],
+                "userAgent": browser_config.get("useragent") or "",
+                "error": str(exc),
+            }
+        finally:
+            if page is not None:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+
+            if context is not None:
+                try:
+                    await context.close()
+                except Exception:
+                    pass
+
+            try:
+                await self.browser_pool.put((index, browser, browser_config))
+            except Exception as exc:
+                if self.debug:
+                    logger.warning(f"Browser {index}: Error returning browser after signup-email: {str(exc)}")
+
+    async def signup_email(self):
+        url = request.args.get('url')
+        email = request.args.get('email')
+        if not url or not email:
+            return jsonify({
+                "errorId": 1,
+                "errorCode": "ERROR_WRONG_PARAMS",
+                "errorDescription": "Both 'url' and 'email' are required",
+            }), 400
+
+        payload = await self._signup_email_via_browser(url, email)
         return jsonify(payload), 200
 
     async def process_turnstile(self):
