@@ -122,6 +122,49 @@ def test_email_service_can_create_moemail_with_provider_override(monkeypatch):
     assert address == "fallback@moemail.app"
 
 
+def test_email_service_can_fetch_moemail_with_provider_override(monkeypatch):
+    service = EmailService(
+        email_provider="worker",
+        worker_domain="worker.example.com",
+        email_domain="003218.xyz",
+        admin_password="demo-pass",
+        moemail_api_base="https://mail.kythron.com",
+        moemail_api_key="demo-key",
+        moemail_domain="moemail.app",
+    )
+
+    def _fake_get(url, headers, timeout):
+        if url == "https://mail.kythron.com/api/emails/email-2":
+            return _DummyResponse(
+                200,
+                {
+                    "messages": [
+                        {
+                            "id": "msg-2",
+                        }
+                    ]
+                },
+            )
+        if url == "https://mail.kythron.com/api/emails/email-2/msg-2":
+            return _DummyResponse(
+                200,
+                {
+                    "message": {
+                        "subject": "DEF-456 xAI confirmation code",
+                        "text": "Use DEF-456 to continue",
+                    }
+                },
+            )
+        raise AssertionError(url)
+
+    monkeypatch.setattr("app.services.register.services.email_service.requests.get", _fake_get)
+
+    content = service.fetch_first_email("email-2", provider_override="moemail")
+
+    assert content is not None
+    assert "DEF-456" in content
+
+
 def test_extract_email_verification_code_accepts_subject_style_code():
     text = "ABC-123 xAI confirmation code"
 
