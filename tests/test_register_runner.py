@@ -69,3 +69,21 @@ def test_send_email_code_records_http_error_details():
 
     assert ok is False
     assert runner._last_send_code_error == "http 403: forbidden"
+
+
+def test_send_email_code_maps_cloudflare_403_to_clearance_hint():
+    class _DummyResponse:
+        def __init__(self, status_code: int, text: str) -> None:
+            self.status_code = status_code
+            self.text = text
+
+    class _DummySession:
+        def post(self, *args, **kwargs):
+            return _DummyResponse(403, "<title>Attention Required! | Cloudflare</title>")
+
+    runner = runner_module.RegisterRunner(target_count=1, thread_count=1)
+
+    ok = runner._send_email_code(_DummySession(), "demo@example.com")
+
+    assert ok is False
+    assert runner._last_send_code_error == "cloudflare challenge blocked request; set grok.cf_clearance"

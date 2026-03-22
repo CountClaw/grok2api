@@ -15,6 +15,7 @@ from urllib.request import Request, urlopen
 from bs4 import BeautifulSoup
 from curl_cffi import requests as curl_requests
 
+from app.core.config import get_config
 from app.core.logger import logger
 from app.services.register.services import (
     EmailService,
@@ -202,6 +203,7 @@ class RegisterRunner:
         self._tokens: List[str] = []
         self._accounts: List[Dict[str, str]] = []
         self._last_send_code_error: Optional[str] = None
+        self._cf_clearance = str(get_config("grok.cf_clearance", "") or "").strip()
 
         self._config: Dict[str, Optional[str]] = {
             "site_key": "0x4AAAAAAAhr9JGVDZbrZOo0",
@@ -305,7 +307,12 @@ class RegisterRunner:
         if not self._config.get("action_id"):
             raise RuntimeError("Register init failed: missing action_id")
 
-    def _send_email_code(self, session: curl_requests.Session, email: str) -> bool:
+    def _send_email_code(
+        self,
+        session: curl_requests.Session,
+        email: str,
+        user_agent: str = BROWSER_USER_AGENT,
+    ) -> bool:
         url = f"{SITE_URL}/auth_mgmt.AuthManagement/CreateEmailValidationCode"
         data = _encode_grpc_message(1, email)
         self._last_send_code_error = None
@@ -313,18 +320,50 @@ class RegisterRunner:
             "content-type": "application/grpc-web+proto",
             "x-grpc-web": "1",
             "x-user-agent": "connect-es/2.1.1",
+            "accept": "*/*",
+            "accept-language": "en-US,en;q=0.9",
             "origin": SITE_URL,
             "referer": SIGNUP_URL,
+            "user-agent": user_agent or BROWSER_USER_AGENT,
+            "sec-fetch-site": "same-origin",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-dest": "empty",
         }
         try:
             res = session.post(url, data=data, headers=headers, timeout=15)
             if res.status_code == 200:
+                logger.info(
+                    "Register: CreateEmailValidationCode ok email={} cookies={}",
+                    email,
+                    ",".join(sorted(session.cookies.get_dict().keys())) or "-",
+                )
                 return True
             body = (getattr(res, "text", "") or "").strip().replace("\n", " ")
-            self._last_send_code_error = f"http {res.status_code}: {body[:200]}" if body else f"http {res.status_code}"
+            lowered_body = body.lower()
+            if res.status_code == 403 and ("cloudflare" in lowered_body or "attention required" in lowered_body):
+                detail = "cloudflare challenge blocked request"
+                if not self._cf_clearance:
+                    detail += "; set grok.cf_clearance"
+                self._last_send_code_error = detail
+            else:
+                self._last_send_code_error = f"http {res.status_code}: {body[:200]}" if body else f"http {res.status_code}"
+            logger.warning(
+                "Register: CreateEmailValidationCode failed email={} status={} cf_clearance={} cookies={} body={}",
+                email,
+                res.status_code,
+                bool(self._cf_clearance),
+                ",".join(sorted(session.cookies.get_dict().keys())) or "-",
+                body[:200] or "-",
+            )
             return False
         except Exception as exc:
             self._last_send_code_error = str(exc)
+            logger.warning(
+                "Register: CreateEmailValidationCode exception email={} cf_clearance={} error={}",
+                email,
+                bool(self._cf_clearance),
+                self._last_send_code_error,
+            )
             return False
 
     def _verify_email_code(self, session: curl_requests.Session, email: str, code: str) -> bool:
@@ -368,9 +407,24 @@ class RegisterRunner:
 
                 with curl_requests.Session(impersonate=impersonate_fingerprint) as session:
                     try:
-                        session.get(SIGNUP_URL, timeout=10)
-                    except Exception:
-                        pass
+                        preheat_headers = {
+                            "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                            "accept-language": "en-US,en;q=0.9",
+                            "user-agent": account_user_agent,
+                        }
+                        if self._cf_clearance:
+                            session.cookies.set("cf_clearance", self._cf_clearance, domain="accounts.x.ai", path="/")
+                        preheat_res = session.get(SIGNUP_URL, headers=preheat_headers, timeout=15)
+                        body_head = (preheat_res.text or "")[:120].replace("\n", " ")
+                        logger.info(
+                            "Register: preheat sign-up status={} cf_clearance={} cookies={} body={}",
+                            preheat_res.status_code,
+                            bool(self._cf_clearance),
+                            ",".join(sorted(session.cookies.get_dict().keys())) or "-",
+                            body_head or "-",
+                        )
+                    except Exception as exc:
+                        logger.warning("Register: preheat sign-up failed: {}", exc)
 
                     password = _generate_random_string()
 
@@ -383,7 +437,7 @@ class RegisterRunner:
                     if self.stop_event.is_set():
                         return
 
-                    if not self._send_email_code(session, email):
+                    if not self._send_email_code(session, email, account_user_agent):
                         fallback_applied = False
                         if email_service.can_fallback_to_moemail():
                             fallback_jwt, fallback_email = email_service.create_email(provider_override="moemail")
@@ -393,7 +447,7 @@ class RegisterRunner:
                                     email,
                                     fallback_email,
                                 )
-                                if self._send_email_code(session, fallback_email):
+                                if self._send_email_code(session, fallback_email, account_user_agent):
                                     jwt, email = fallback_jwt, fallback_email
                                     fallback_applied = True
                         if not fallback_applied:
