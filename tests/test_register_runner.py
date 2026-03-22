@@ -148,3 +148,42 @@ def test_preflight_signup_with_solver_applies_cf_clearance_and_user_agent(monkey
     assert session.cookies.get("cf_clearance") == "demo-clearance"
     assert runner._cf_clearance == "demo-clearance"
     assert runner._solver_user_agent == "Mozilla/5.0 Test Solver"
+
+
+def test_send_email_code_via_solver_browser_accepts_verify_step(monkeypatch):
+    class _DummyResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "submitted": True,
+                "verifyStepReady": True,
+                "displayedEmail": "demo@example.com",
+                "title": "Create Your Grok Account",
+                "bodySnippet": "We've emailed a code to demo@example.com",
+                "userAgent": "Mozilla/5.0 Solver Browser",
+                "cookies": [
+                    {
+                        "name": "cf_clearance",
+                        "value": "browser-clearance",
+                        "domain": "accounts.x.ai",
+                        "path": "/",
+                    }
+                ],
+            }
+
+    class _DummySession:
+        def __init__(self) -> None:
+            self.cookies = _DummyCookies()
+
+    monkeypatch.setattr(runner_module.http_requests, "get", lambda *args, **kwargs: _DummyResponse())
+
+    runner = runner_module.RegisterRunner(target_count=1, thread_count=1)
+    session = _DummySession()
+
+    ok = runner._send_email_code_via_solver_browser(session, "demo@example.com", "Mozilla/5.0 Original")
+
+    assert ok is True
+    assert session.cookies.get("cf_clearance") == "browser-clearance"
+    assert runner._solver_user_agent == "Mozilla/5.0 Solver Browser"
