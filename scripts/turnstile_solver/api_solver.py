@@ -5,7 +5,7 @@ import uuid
 import random
 import logging
 import asyncio
-from typing import Optional, Union
+from typing import Dict, List, Optional, Union
 import argparse
 from quart import Quart, request, jsonify
 try:
@@ -152,6 +152,7 @@ class TurnstileAPIServer:
         self.app.before_serving(self._startup)
         self.app.route('/turnstile', methods=['GET'])(self.process_turnstile)
         self.app.route('/result', methods=['GET'])(self.get_result)
+        self.app.route('/preflight', methods=['GET'])(self.preflight_signup)
         self.app.route('/')(self.index)
         
 
@@ -537,6 +538,84 @@ class TurnstileAPIServer:
             };
         }
         """)
+
+    async def _read_body_snippet(self, page, limit: int = 600) -> str:
+        try:
+            return await page.evaluate(
+                """(maxLength) => {
+                    const text = document.body
+                        ? String(document.body.innerText || document.body.textContent || "")
+                        : "";
+                    return text.replace(/\\s+/g, " ").trim().slice(0, maxLength);
+                }""",
+                limit,
+            )
+        except Exception:
+            return ""
+
+    async def _read_signup_state(self, page) -> Dict[str, Union[str, int, bool]]:
+        title = ""
+        current_url = ""
+        email_count = 0
+        signup_button_count = 0
+        password_count = 0
+
+        try:
+            title = await page.title()
+        except Exception:
+            title = ""
+
+        try:
+            current_url = page.url or ""
+        except Exception:
+            current_url = ""
+
+        try:
+            email_count = await page.locator('input[name="email"]').count()
+        except Exception:
+            email_count = 0
+
+        try:
+            signup_button_count = await page.locator("button:has-text('Sign up with email')").count()
+        except Exception:
+            signup_button_count = 0
+
+        try:
+            password_count = await page.locator('input[name="password"]').count()
+        except Exception:
+            password_count = 0
+
+        body_snippet = await self._read_body_snippet(page, limit=700)
+        lowered_title = title.lower()
+        lowered_body = body_snippet.lower()
+
+        return {
+            "title": title,
+            "url": current_url,
+            "bodySnippet": body_snippet,
+            "emailInputCount": email_count,
+            "signUpButtonCount": signup_button_count,
+            "passwordInputCount": password_count,
+            "signupReady": email_count > 0 or signup_button_count > 0 or password_count > 0,
+            "challengePresent": (
+                "just a moment" in lowered_title
+                or "attention required" in lowered_title
+                or "checking your browser" in lowered_title
+                or "cloudflare" in lowered_body
+            ),
+        }
+
+    def _build_context_options(self, browser_config: Dict[str, str]) -> Dict[str, Union[str, Dict[str, str]]]:
+        context_options: Dict[str, Union[str, Dict[str, str]]] = {
+            "user_agent": browser_config['useragent']
+        }
+
+        if browser_config['sec_ch_ua'] and browser_config['sec_ch_ua'].strip():
+            context_options['extra_http_headers'] = {
+                'sec-ch-ua': browser_config['sec_ch_ua']
+            }
+
+        return context_options
 
     async def _get_turnstile_box(self, page, index: int):
         """获取 Cloudflare iframe 的坐标。"""
@@ -1006,6 +1085,178 @@ class TurnstileAPIServer:
 
 
 
+
+    async def _preflight_signup(self, url: str):
+        index, browser, browser_config = await self.browser_pool.get()
+        context = None
+        page = None
+
+        try:
+            try:
+                if hasattr(browser, 'is_connected') and not browser.is_connected():
+                    logger.warning(f"Browser {index}: Browser disconnected during preflight")
+                    return {
+                        "signupReady": False,
+                        "challengePresent": False,
+                        "error": "browser disconnected",
+                        "title": "",
+                        "url": url,
+                        "bodySnippet": "",
+                        "cookies": [],
+                        "userAgent": browser_config.get("useragent") or "",
+                    }
+            except Exception as exc:
+                if self.debug:
+                    logger.warning(f"Browser {index}: Cannot check browser state during preflight: {str(exc)}")
+
+            context = await browser.new_context(**self._build_context_options(browser_config))
+            page = await context.new_page()
+
+            await self._antishadow_inject(page)
+            await page.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => undefined,
+            });
+
+            window.chrome = {
+                runtime: {},
+                loadTimes: function() {},
+                csi: function() {},
+            };
+            """)
+
+            if self.browser_type in ['chromium', 'chrome', 'msedge']:
+                await page.set_viewport_size({"width": 1280, "height": 900})
+
+            logger.info(f"Browser {index}: Starting signup preflight for {url}")
+            await page.goto(url, wait_until='domcontentloaded', timeout=45000)
+
+            try:
+                await page.wait_for_load_state('networkidle', timeout=5000)
+            except Exception:
+                if self.debug:
+                    logger.debug(f"Browser {index}: signup preflight networkidle wait timed out")
+
+            click_count = 0
+            signup_state = {}
+            turnstile_state = {}
+
+            for attempt in range(18):
+                signup_state = await self._read_signup_state(page)
+                turnstile_state = await self._read_turnstile_state(page)
+                cookies = await context.cookies()
+                has_clearance = any(
+                    cookie.get("name") == "cf_clearance" and str(cookie.get("value") or "").strip()
+                    for cookie in cookies
+                )
+                challenge_present = bool(signup_state.get("challengePresent")) or bool(turnstile_state.get("hasWidget"))
+
+                if signup_state.get("signUpButtonCount", 0) and not signup_state.get("emailInputCount", 0):
+                    try:
+                        await page.locator("button:has-text('Sign up with email')").first.click(timeout=3000)
+                        await asyncio.sleep(1)
+                        signup_state = await self._read_signup_state(page)
+                    except Exception as exc:
+                        if self.debug:
+                            logger.debug(f"Browser {index}: Sign up with email click skipped: {str(exc)}")
+
+                if signup_state.get("signupReady") or has_clearance:
+                    break
+
+                if challenge_present and attempt in {1, 3, 5, 8, 11, 14}:
+                    click_success = await self._click_turnstile_box(page, index)
+                    if not click_success:
+                        click_success = await self._try_click_strategies(page, index)
+                    click_count += 1
+                    logger.info(f"Browser {index}: signup preflight click attempt {click_count} success={click_success}")
+                    await asyncio.sleep(2)
+                    continue
+
+                if attempt in {0, 4, 9, 14, 17}:
+                    logger.info(
+                        f"Browser {index}: signup preflight attempt={attempt + 1} "
+                        f"ready={bool(signup_state.get('signupReady'))} "
+                        f"challenge={challenge_present} "
+                        f"cookies={','.join(sorted(str(cookie.get('name') or '') for cookie in cookies if cookie.get('name'))) or '-'} "
+                        f"title={str(signup_state.get('title') or '-')}"
+                    )
+
+                await asyncio.sleep(1.2)
+
+            signup_state = await self._read_signup_state(page)
+            turnstile_state = await self._read_turnstile_state(page)
+            cookies = await context.cookies()
+            has_clearance = any(
+                cookie.get("name") == "cf_clearance" and str(cookie.get("value") or "").strip()
+                for cookie in cookies
+            )
+            challenge_present = bool(signup_state.get("challengePresent")) or bool(turnstile_state.get("hasWidget"))
+
+            payload = {
+                "signupReady": bool(signup_state.get("signupReady")),
+                "challengePresent": challenge_present,
+                "title": str(signup_state.get("title") or ""),
+                "url": str(signup_state.get("url") or url),
+                "bodySnippet": str(signup_state.get("bodySnippet") or ""),
+                "emailInputCount": int(signup_state.get("emailInputCount") or 0),
+                "signUpButtonCount": int(signup_state.get("signUpButtonCount") or 0),
+                "passwordInputCount": int(signup_state.get("passwordInputCount") or 0),
+                "hasCfClearance": has_clearance,
+                "turnstileState": turnstile_state,
+                "cookies": cookies,
+                "userAgent": browser_config.get("useragent") or "",
+            }
+            logger.info(
+                f"Browser {index}: signup preflight done "
+                f"ready={payload['signupReady']} challenge={payload['challengePresent']} "
+                f"has_cf_clearance={payload['hasCfClearance']} "
+                f"cookies={','.join(sorted(str(cookie.get('name') or '') for cookie in cookies if cookie.get('name'))) or '-'} "
+                f"title={payload['title'] or '-'} body={str(payload['bodySnippet'])[:180] or '-'}"
+            )
+            return payload
+        except Exception as exc:
+            logger.warning(f"Browser {index}: signup preflight failed: {str(exc)}")
+            return {
+                "signupReady": False,
+                "challengePresent": False,
+                "error": str(exc),
+                "title": "",
+                "url": url,
+                "bodySnippet": "",
+                "cookies": [],
+                "userAgent": browser_config.get("useragent") or "",
+            }
+        finally:
+            if page is not None:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+
+            if context is not None:
+                try:
+                    await context.close()
+                except Exception:
+                    pass
+
+            try:
+                await self.browser_pool.put((index, browser, browser_config))
+            except Exception as exc:
+                if self.debug:
+                    logger.warning(f"Browser {index}: Error returning browser after preflight: {str(exc)}")
+
+    async def preflight_signup(self):
+        """预热 signup 页面并返回 Cloudflare/页面诊断信息。"""
+        url = request.args.get('url')
+        if not url:
+            return jsonify({
+                "errorId": 1,
+                "errorCode": "ERROR_WRONG_PAGEURL",
+                "errorDescription": "Missing 'url' parameter",
+            }), 400
+
+        payload = await self._preflight_signup(url)
+        return jsonify(payload), 200
 
     async def process_turnstile(self):
         """Handle the /turnstile endpoint requests."""
