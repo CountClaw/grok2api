@@ -1,6 +1,7 @@
 """Local Turnstile solver process manager."""
 from __future__ import annotations
 
+import os
 import socket
 import subprocess
 import sys
@@ -180,6 +181,14 @@ class TurnstileSolverProcess:
         if lock_path.exists():
             return
 
+        if self._has_preinstalled_playwright_chromium():
+            try:
+                lock_path.write_text(str(time.time()), encoding="utf-8")
+            except Exception:
+                pass
+            logger.info("Detected preinstalled Playwright Chromium, skipping install.")
+            return
+
         try:
             logger.info("Installing Playwright Chromium (first run)...")
             args = [python_exe, "-m", "playwright", "install"]
@@ -192,6 +201,57 @@ class TurnstileSolverProcess:
         except Exception as exc:
             # Don't create lock file; let next run retry.
             raise RuntimeError(f"Playwright browser install failed: {exc}") from exc
+
+    def _has_preinstalled_playwright_chromium(self) -> bool:
+        """Detect whether Playwright Chromium is already present on disk.
+
+        This avoids re-running `playwright install --with-deps chromium` in Docker
+        when `/app/data` is volume-mounted and the lock file disappears.
+        """
+        prefixes = ("chromium-", "chromium_headless_shell-")
+        for root in self._candidate_playwright_browser_roots():
+            if not root.exists() or not root.is_dir():
+                continue
+            try:
+                for child in root.iterdir():
+                    if child.is_dir() and child.name.startswith(prefixes):
+                        return True
+            except Exception:
+                continue
+        return False
+
+    def _candidate_playwright_browser_roots(self) -> list[Path]:
+        roots: list[Path] = []
+
+        env_root = os.getenv("PLAYWRIGHT_BROWSERS_PATH", "").strip()
+        if env_root and env_root != "0":
+            roots.append(Path(env_root).expanduser())
+
+        home = Path.home()
+        if sys.platform.startswith("linux"):
+            roots.extend(
+                [
+                    Path("/ms-playwright"),
+                    home / ".cache" / "ms-playwright",
+                    Path("/root/.cache/ms-playwright"),
+                ]
+            )
+        elif sys.platform == "darwin":
+            roots.append(home / "Library" / "Caches" / "ms-playwright")
+        elif sys.platform.startswith("win"):
+            local_app_data = os.getenv("LOCALAPPDATA", "").strip()
+            if local_app_data:
+                roots.append(Path(local_app_data) / "ms-playwright")
+
+        deduped: list[Path] = []
+        seen: set[str] = set()
+        for root in roots:
+            key = str(root).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(root)
+        return deduped
 
     def _parse_host_port(self) -> tuple[str, int]:
         parsed = urlparse(self.config.url)
