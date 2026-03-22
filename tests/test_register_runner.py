@@ -33,12 +33,12 @@ def test_init_config_falls_back_to_urllib_when_curl_scan_misses_action_id(monkey
             return None
 
         def get(self, url: str, timeout: int = 15):
-            if url.endswith("/sign-up"):
+            if "/sign-up" in url:
                 return _DummyResponse(html)
             return _DummyResponse("console.log('no action id here');")
 
     def _fake_fetch_text_via_urllib(url: str, *, referer=None, accept="*/*") -> str:
-        if url.endswith("/sign-up"):
+        if "/sign-up" in url and url.endswith(".js") is False:
             return html
         if url.endswith("/_next/static/chunks/e74a065e123a76d2.js"):
             return f'let action=createServerReference("{action_id}",callServer,void 0,findSourceMapURL,"default");'
@@ -51,3 +51,21 @@ def test_init_config_falls_back_to_urllib_when_curl_scan_misses_action_id(monkey
     runner._init_config()
 
     assert runner._config["action_id"] == action_id
+
+
+def test_send_email_code_records_http_error_details():
+    class _DummyResponse:
+        def __init__(self, status_code: int, text: str) -> None:
+            self.status_code = status_code
+            self.text = text
+
+    class _DummySession:
+        def post(self, *args, **kwargs):
+            return _DummyResponse(403, "forbidden")
+
+    runner = runner_module.RegisterRunner(target_count=1, thread_count=1)
+
+    ok = runner._send_email_code(_DummySession(), "demo@example.com")
+
+    assert ok is False
+    assert runner._last_send_code_error == "http 403: forbidden"

@@ -201,6 +201,7 @@ class RegisterRunner:
         self._start_time = 0.0
         self._tokens: List[str] = []
         self._accounts: List[Dict[str, str]] = []
+        self._last_send_code_error: Optional[str] = None
 
         self._config: Dict[str, Optional[str]] = {
             "site_key": "0x4AAAAAAAhr9JGVDZbrZOo0",
@@ -307,6 +308,7 @@ class RegisterRunner:
     def _send_email_code(self, session: curl_requests.Session, email: str) -> bool:
         url = f"{SITE_URL}/auth_mgmt.AuthManagement/CreateEmailValidationCode"
         data = _encode_grpc_message(1, email)
+        self._last_send_code_error = None
         headers = {
             "content-type": "application/grpc-web+proto",
             "x-grpc-web": "1",
@@ -316,9 +318,13 @@ class RegisterRunner:
         }
         try:
             res = session.post(url, data=data, headers=headers, timeout=15)
-            return res.status_code == 200
+            if res.status_code == 200:
+                return True
+            body = (getattr(res, "text", "") or "").strip().replace("\n", " ")
+            self._last_send_code_error = f"http {res.status_code}: {body[:200]}" if body else f"http {res.status_code}"
+            return False
         except Exception as exc:
-            self._record_error(f"send code error: {email} - {exc}")
+            self._last_send_code_error = str(exc)
             return False
 
     def _verify_email_code(self, session: curl_requests.Session, email: str, code: str) -> bool:
@@ -362,7 +368,7 @@ class RegisterRunner:
 
                 with curl_requests.Session(impersonate=impersonate_fingerprint) as session:
                     try:
-                        session.get(SITE_URL, timeout=10)
+                        session.get(SIGNUP_URL, timeout=10)
                     except Exception:
                         pass
 
@@ -391,7 +397,8 @@ class RegisterRunner:
                                     jwt, email = fallback_jwt, fallback_email
                                     fallback_applied = True
                         if not fallback_applied:
-                            self._record_error(f"send_email_code failed: {email}")
+                            detail = f" ({self._last_send_code_error})" if self._last_send_code_error else ""
+                            self._record_error(f"send_email_code failed: {email}{detail}")
                             time.sleep(5)
                             continue
 
