@@ -17,7 +17,8 @@ const NUMERIC_FIELDS = new Set([
   'reload_interval_sec',
   'solver_threads',
   'register_threads',
-  'default_count'
+  'default_count',
+  'moemail_expiry_time_ms'
 ]);
 
 const LOCALE_MAP = {
@@ -71,9 +72,14 @@ const LOCALE_MAP = {
   },
   "register": {
     "label": "自动注册",
+    "email_provider": { title: "邮箱提供商", desc: "自动注册临时邮箱来源：worker / moemail。" },
     "worker_domain": { title: "Worker 域名", desc: "临时邮箱 Worker 的域名（不含 https://）。" },
     "email_domain": { title: "邮箱域名", desc: "临时邮箱使用的域名，如 example.com。" },
     "admin_password": { title: "邮箱管理密码", desc: "Worker 后台的管理密钥。" },
+    "moemail_api_base": { title: "Moemail API 地址", desc: "Kythron / Moemail 接口地址，默认 https://mail.kythron.com。" },
+    "moemail_api_key": { title: "Moemail API Key", desc: "用于调用 /api/config、/api/emails/generate 等接口的密钥。" },
+    "moemail_domain": { title: "Moemail 域名", desc: "Moemail 生成邮箱时使用的域名，例如 moemail.app。" },
+    "moemail_expiry_time_ms": { title: "Moemail 有效期(毫秒)", desc: "邮箱有效期，推荐 3600000 / 86400000 / 604800000 / 0。" },
     "yescaptcha_key": { title: "YesCaptcha Key", desc: "可选。填写后优先使用 YesCaptcha。" },
     "solver_url": { title: "Solver 地址", desc: "本地 Turnstile Solver 地址，默认 http://127.0.0.1:5072。" },
     "solver_browser_type": { title: "Solver 浏览器", desc: "Solver 使用的浏览器类型：chromium / chrome / msedge / camoufox。建议使用 camoufox（对 accounts.x.ai 成功率更高）。" },
@@ -246,6 +252,26 @@ function renderConfig(data) {
           option.value = opt.val;
           option.text = opt.text;
           if (val === opt.val) option.selected = true;
+          input.appendChild(option);
+        });
+        inputWrapper.appendChild(input);
+      }
+      else if (key === 'email_provider') {
+        input = document.createElement('select');
+        input.className = 'geist-input h-[34px]';
+        input.dataset.section = section;
+        input.dataset.key = key;
+
+        const opts = [
+          { val: 'worker', text: 'worker' },
+          { val: 'moemail', text: 'moemail' }
+        ];
+
+        opts.forEach(opt => {
+          const option = document.createElement('option');
+          option.value = opt.val;
+          option.text = opt.text;
+          if ((val || 'worker') === opt.val) option.selected = true;
           input.appendChild(option);
         });
         inputWrapper.appendChild(input);

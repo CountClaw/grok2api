@@ -70,6 +70,20 @@ def _extract_action_id_from_text(text: str) -> Optional[str]:
     return None
 
 
+def _extract_email_verification_code(text: str) -> Optional[str]:
+    patterns = [
+        r">([A-Z0-9]{3}-[A-Z0-9]{3})<",
+        r"\b([A-Z0-9]{3}-[A-Z0-9]{3})\b",
+        r"(?i)(?:confirmation|verification|code|验证码)[^A-Z0-9]{0,24}([A-Z0-9]{6,8})",
+        r"(?<!\d)(\d{6,8})(?!\d)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text or "")
+        if match:
+            return match.group(1).replace("-", "")
+    return None
+
+
 def _random_chrome_profile() -> Tuple[str, str]:
     profile = random.choice(CHROME_PROFILES)
     if profile.get("brand") == "edge":
@@ -311,9 +325,9 @@ class RegisterRunner:
                             return
                         content = email_service.fetch_first_email(jwt)
                         if content:
-                            match = re.search(r">([A-Z0-9]{3}-[A-Z0-9]{3})<", content)
-                            if match:
-                                verify_code = match.group(1).replace("-", "")
+                            code = _extract_email_verification_code(content)
+                            if code:
+                                verify_code = code
                                 break
 
                     if not verify_code:

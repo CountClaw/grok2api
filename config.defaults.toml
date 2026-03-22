@@ -43,9 +43,14 @@ assets_delete_batch_size = 10
 admin_assets_batch_size = 10
 
 [register]
+email_provider = "worker"
 worker_domain = ""
 email_domain = ""
 admin_password = ""
+moemail_api_base = "https://mail.kythron.com"
+moemail_api_key = ""
+moemail_domain = "moemail.app"
+moemail_expiry_time_ms = 3600000
 yescaptcha_key = ""
 solver_url = "http://127.0.0.1:5072"
 # 推荐 camoufox（对 accounts.x.ai 的 Turnstile 成功率更高）；若环境未安装会自动回退到 chromium。

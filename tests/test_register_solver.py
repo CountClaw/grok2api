@@ -26,3 +26,16 @@ def test_ensure_playwright_browsers_skips_install_when_chromium_preinstalled(mon
 
     assert called["value"] is False
     assert (tmp_path / "data" / ".locks" / "playwright_chromium_v1.lock").exists()
+
+
+def test_select_runtime_falls_back_to_chromium_when_camoufox_system_lib_missing(monkeypatch):
+    process = solver_module.TurnstileSolverProcess(
+        solver_module.SolverConfig(url="http://127.0.0.1:5072", browser_type="camoufox")
+    )
+
+    monkeypatch.setattr(solver_module.sys, "platform", "linux")
+    monkeypatch.setattr(solver_module, "find_library", lambda name: None if name == "gtk-3" else "ok")
+
+    process._select_runtime()
+
+    assert process._actual_browser_type == "chromium"

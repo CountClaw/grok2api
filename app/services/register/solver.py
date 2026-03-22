@@ -1,6 +1,7 @@
 """Local Turnstile solver process manager."""
 from __future__ import annotations
 
+from ctypes.util import find_library
 import os
 import socket
 import subprocess
@@ -89,6 +90,12 @@ class TurnstileSolverProcess:
             paths.append(p)
         return paths
 
+    def _camoufox_system_supported(self) -> bool:
+        """Check whether the current OS has the basic shared libraries camoufox needs."""
+        if not sys.platform.startswith("linux"):
+            return True
+        return bool(find_library("gtk-3"))
+
     def _select_runtime(self) -> None:
         """Pick python executable + browser type to run solver with.
 
@@ -137,20 +144,26 @@ class TurnstileSolverProcess:
         self._actual_browser_type = desired
 
         if desired == "camoufox":
+            if not self._camoufox_system_supported():
+                logger.warning(
+                    "Camoufox system deps missing (gtk-3). Falling back solver browser to chromium."
+                )
+                self._actual_browser_type = "chromium"
+            else:
             # Prefer patchright if possible.
-            exe = _pick_with(["quart", "camoufox", "patchright"])
-            if exe:
-                self._python_exe = exe
-                return
+                exe = _pick_with(["quart", "camoufox", "patchright"])
+                if exe:
+                    self._python_exe = exe
+                    return
 
-            exe = _pick_with(["quart", "camoufox", "playwright"])
-            if exe:
-                self._python_exe = exe
-                return
+                exe = _pick_with(["quart", "camoufox", "playwright"])
+                if exe:
+                    self._python_exe = exe
+                    return
 
-            # No camoufox in any known interpreter; fallback to chromium.
-            logger.warning("Camoufox not available. Falling back solver browser to chromium.")
-            self._actual_browser_type = "chromium"
+                # No camoufox in any known interpreter; fallback to chromium.
+                logger.warning("Camoufox not available. Falling back solver browser to chromium.")
+                self._actual_browser_type = "chromium"
 
         # For chromium/chrome/msedge, prefer patchright if available.
         exe = _pick_with(["quart", "patchright"])
