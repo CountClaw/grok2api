@@ -77,6 +77,7 @@ class TurnstileService:
     ) -> Optional[str]:
         """Fetch a Turnstile solution token."""
         self.last_error = None
+        last_status: Optional[str] = None
         # Make shutdown/cancel responsive.
         if initial_delay > 0:
             for _ in range(int(initial_delay * 10)):
@@ -101,6 +102,7 @@ class TurnstileService:
                         return None
 
                     status = data.get("status")
+                    last_status = str(status or "")
                     if status == "ready":
                         token = data.get("solution", {}).get("token")
                         if token:
@@ -138,6 +140,8 @@ class TurnstileService:
                     self.last_error = str(data.get("errorDescription") or data.get("errorCode") or "solver error")
                     return None
 
+                last_status = str(data.get("status") or "")
+
                 token = data.get("solution", {}).get("token")
                 if token:
                     if token != "CAPTCHA_FAIL":
@@ -158,4 +162,11 @@ class TurnstileService:
                             return None
                         time.sleep(0.1)
 
+        if not self.last_error:
+            if last_status == "processing":
+                self.last_error = "solver timeout waiting for token"
+            elif last_status:
+                self.last_error = f"solver unexpected status: {last_status}"
+            else:
+                self.last_error = "solver returned empty token"
         return None
