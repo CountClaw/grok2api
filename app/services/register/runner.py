@@ -36,6 +36,40 @@ CHROME_PROFILES = [
 ]
 
 
+def _extract_js_urls_from_html(start_url: str, html: str) -> List[str]:
+    urls: List[str] = []
+    seen: set[str] = set()
+
+    candidates = [
+        *[script["src"] for script in BeautifulSoup(html, "html.parser").find_all("script", src=True)],
+        *[m.group(0) for m in re.finditer(r"/_next/static/chunks/[^\"'\s>]+\.js", html)],
+    ]
+
+    for raw in candidates:
+        raw = (raw or "").strip().replace("\\/", "/")
+        if not raw or "_next/static" not in raw:
+            continue
+        url = urljoin(start_url, raw)
+        if url in seen:
+            continue
+        seen.add(url)
+        urls.append(url)
+
+    return urls
+
+
+def _extract_action_id_from_text(text: str) -> Optional[str]:
+    patterns = [
+        r"7f[a-fA-F0-9]{40}",
+        r"(?<![a-fA-F0-9])7f[a-fA-F0-9]{30,}(?![a-fA-F0-9])",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text or "")
+        if match:
+            return match.group(0)
+    return None
+
+
 def _random_chrome_profile() -> Tuple[str, str]:
     profile = random.choice(CHROME_PROFILES)
     if profile.get("brand") == "edge":
@@ -175,17 +209,17 @@ class RegisterRunner:
             if tree_match:
                 self._config["state_tree"] = tree_match.group(1)
 
-            soup = BeautifulSoup(html, "html.parser")
-            js_urls = [
-                urljoin(start_url, script["src"])
-                for script in soup.find_all("script", src=True)
-                if "_next/static" in script["src"]
-            ]
+            js_urls = _extract_js_urls_from_html(start_url, html)
+            html_action_id = _extract_action_id_from_text(html)
+            if html_action_id:
+                self._config["action_id"] = html_action_id
+                logger.info("Register: Action ID found in HTML: {}", self._config["action_id"])
+
             for js_url in js_urls:
                 js_content = session.get(js_url, timeout=15).text
-                match = re.search(r"7f[a-fA-F0-9]{40}", js_content)
-                if match:
-                    self._config["action_id"] = match.group(0)
+                action_id = _extract_action_id_from_text(js_content)
+                if action_id:
+                    self._config["action_id"] = action_id
                     logger.info("Register: Action ID found: {}", self._config["action_id"])
                     break
 
