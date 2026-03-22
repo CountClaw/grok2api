@@ -26,6 +26,7 @@ from app.services.register.services import (
 
 
 SITE_URL = "https://accounts.x.ai"
+SIGNUP_URL = f"{SITE_URL}/sign-up?redirect=grok-com"
 DEFAULT_IMPERSONATE = "chrome120"
 BROWSER_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -258,7 +259,7 @@ class RegisterRunner:
 
     def _init_config(self) -> None:
         logger.info("Register: initializing action config...")
-        start_url = f"{SITE_URL}/sign-up"
+        start_url = SIGNUP_URL
 
         try:
             with curl_requests.Session(impersonate=DEFAULT_IMPERSONATE) as session:
@@ -311,7 +312,7 @@ class RegisterRunner:
             "x-grpc-web": "1",
             "x-user-agent": "connect-es/2.1.1",
             "origin": SITE_URL,
-            "referer": f"{SITE_URL}/sign-up?redirect=grok-com",
+            "referer": SIGNUP_URL,
         }
         try:
             res = session.post(url, data=data, headers=headers, timeout=15)
@@ -328,7 +329,7 @@ class RegisterRunner:
             "x-grpc-web": "1",
             "x-user-agent": "connect-es/2.1.1",
             "origin": SITE_URL,
-            "referer": f"{SITE_URL}/sign-up?redirect=grok-com",
+            "referer": SIGNUP_URL,
         }
         try:
             res = session.post(url, data=data, headers=headers, timeout=15)
@@ -408,13 +409,19 @@ class RegisterRunner:
                             return
 
                         try:
-                            task_id = turnstile_service.create_task(f"{SITE_URL}/sign-up", self._config["site_key"] or "")
+                            task_id = turnstile_service.create_task(SIGNUP_URL, self._config["site_key"] or "")
                         except Exception as exc:
                             self._record_error(f"turnstile create_task failed: {exc}")
                             time.sleep(2)
                             continue
 
-                        token = turnstile_service.get_response(task_id, stop_event=self.stop_event)
+                        token = turnstile_service.get_response(
+                            task_id,
+                            max_retries=60,
+                            initial_delay=3,
+                            retry_delay=2,
+                            stop_event=self.stop_event,
+                        )
 
                         if not token:
                             self._record_error(f"turnstile failed: {turnstile_service.last_error or 'no token'}")
@@ -426,7 +433,7 @@ class RegisterRunner:
                             "accept": "text/x-component",
                             "content-type": "text/plain;charset=UTF-8",
                             "origin": SITE_URL,
-                            "referer": f"{SITE_URL}/sign-up",
+                            "referer": SIGNUP_URL,
                             "cookie": f"__cf_bm={session.cookies.get('__cf_bm','')}",
                             "next-router-state-tree": self._config["state_tree"] or "",
                             "next-action": final_action_id,
